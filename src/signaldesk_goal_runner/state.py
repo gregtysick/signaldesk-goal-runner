@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -41,7 +42,19 @@ def _atomic_replace(path: Path, data: bytes) -> None:
 @contextmanager
 def _local_lock(path: Path):
     """Serialize cooperating processes on one host, never independent replicas."""
-    with Path(path).open("a+b") as stream:
+    path = Path(path)
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise StateError("invalid lock file")
+    except FileNotFoundError:
+        pass
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise StateError("cannot safely open lock") from exc
+    with os.fdopen(descriptor, "a+b") as stream:
         if os.name == "nt":
             import msvcrt
             stream.seek(0, os.SEEK_END)
@@ -85,11 +98,15 @@ class EventStore:
 
     def initialize(self) -> None:
         self._check()
+        if self.root.is_symlink() or (self.root.exists() and not self.root.is_dir()):
+            raise StateError("invalid state root")
+        if self.root.exists() and any(p.name != "state.lock" for p in self.root.iterdir()):
+            raise StateError("state root is not empty")
         self.root.mkdir(parents=True, exist_ok=True)
         with _local_lock(self.lock):
             self._check()
-            if self.events.exists() or self.checkpoint.exists():
-                raise StateError("state already exists")
+            if any(p.name != "state.lock" for p in self.root.iterdir()):
+                raise StateError("state root is not empty")
             self.events.mkdir()
             _atomic_replace(self.checkpoint, _encode({"sequence": 0, "head": None, "events": {}}))
 
@@ -97,17 +114,21 @@ class EventStore:
         self._check()
         if not self.events.is_dir() or not self.checkpoint.is_file():
             raise StateError("state absent")
-        if any(p.is_symlink() or p.name.endswith(".tmp") or "conflicted copy" in p.name.casefold()
+        if any(p.is_symlink() or p.name.casefold().endswith(".tmp") or "conflicted copy" in p.name.casefold() or "sync conflict" in p.name.casefold()
                for p in self.root.rglob("*")):
             raise StateError("conflict or interrupted save")
         try:
             saved = json.loads(self.checkpoint.read_text(encoding="utf-8"))
+            if not isinstance(saved, dict):
+                raise StateError("invalid checkpoint schema")
             files = sorted(self.events.glob("*.json"))
             rebuilt = {"sequence": 0, "head": None, "events": {}}
             if len(files) != saved.get("sequence"):
                 raise StateError("event/checkpoint mismatch")
             for number, path in enumerate(files, 1):
                 event = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(event, dict):
+                    raise StateError("invalid event schema")
                 body = {key: event.get(key) for key in ("sequence", "id", "previous", "payload")}
                 if (path.name != f"{number:08}.json" or body["sequence"] != number
                     or body["previous"] != rebuilt["head"] or body["id"] in rebuilt["events"]
