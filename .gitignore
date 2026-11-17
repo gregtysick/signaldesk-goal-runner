@@ -1,0 +1,17 @@
+# Default deny keeps local development records out of public commits.
+/*
+!/.gitignore
+!/README.md
+!/pyproject.toml
+!/src/
+!/src/**
+!/tests/
+!/tests/**
+!/docs/
+!/docs/**
+**/__pycache__/
+*.py[cod]
+.env
+.env.*
+*.pem
+*.key
